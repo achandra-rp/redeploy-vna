@@ -1,0 +1,47 @@
+# VNA Redeployment Script - Generated Files and Directories
+
+# Generated VNA CR files
+*-vna.yaml
+rpvna-dev.yaml
+
+# Cloned repository directories
+rpvna-source-config/
+ac001001-target-config/
+*-source-config/
+*-target-config/
+
+# Legacy directory names (cleanup from old versions)
+cluster-config/
+rp-vna-deployments-dev/
+
+# Temporary files
+*.tmp
+*.temp
+.DS_Store
+
+# Logs and debug files
+*.log
+debug.txt
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Editor temporary files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# SSH and credential files (safety)
+*.key
+*.pem
+id_rsa*
+known_hosts
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
