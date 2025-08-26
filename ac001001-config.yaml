@@ -1,0 +1,36 @@
+# VNA Configuration for ac001001 namespace
+# Usage: ./redeploy-vna.sh --config ac001001-config.yaml SOURCE_NAMESPACE ac001001
+
+namespace_configs:
+  ac001001:
+    database:
+      mode: "remote"
+      default_host: "rpvna-ac001-default-pgdb-proxy.proxy-cb4o8sm06f6f.us-east-1.rds.amazonaws.com"
+      volatile_host: "rpvna-ac001-volatile-pgdb-proxy.proxy-cb4o8sm06f6f.us-east-1.rds.amazonaws.com"
+    github:
+      config_branch: "ac001001"  # Branch in your config repo
+    storage:
+      dicom_size: "2048G"
+      log_size: "200G"
+
+# You can add other production-like namespaces here
+# ac001002:
+#   database:
+#     mode: "remote" 
+#     default_host: "rpvna-ac002-default-pgdb-proxy.proxy-cb4o8sm06f6f.us-east-1.rds.amazonaws.com"
+#     volatile_host: "rpvna-ac002-volatile-pgdb-proxy.proxy-cb4o8sm06f6f.us-east-1.rds.amazonaws.com"
+#   github:
+#     config_branch: "ac001002"
+#   storage:
+#     dicom_size: "2048G" 
+#     log_size: "200G"
+
+# Default fallback configuration
+defaults:
+  database:
+    mode: "remote"
+    default_host: "rpvna-dev-default-pgdb.cb4o8sm06f6f.us-east-1.rds.amazonaws.com"
+    volatile_host: "rpvna-dev-volatile-pgdb.cb4o8sm06f6f.us-east-1.rds.amazonaws.com"
+  storage:
+    dicom_size: "100G"
+    log_size: "10G"
