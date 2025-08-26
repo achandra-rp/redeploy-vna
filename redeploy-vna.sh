@@ -4,19 +4,118 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Global cleanup tracking
+TEMP_FILES=()
+CLEANUP_NEEDED=false
+
+# Cleanup function for script exit
+cleanup_on_exit() {
+    local exit_code=$?
+    
+    if [[ "$CLEANUP_NEEDED" == "true" ]]; then
+        echo
+        echo "=== Cleaning up temporary resources ==="
+        
+        # Clean up temporary files
+        for temp_file in "${TEMP_FILES[@]}"; do
+            if [[ -f "$temp_file" ]]; then
+                echo "Removing temporary file: $temp_file"
+                rm -f "$temp_file"
+            fi
+        done
+        
+        # Clean up any stray temporary manifest files in /tmp
+        find /tmp -name "db-inspector-*.yaml" -mtime +1 -delete 2>/dev/null || true
+        
+        echo "Cleanup complete"
+    fi
+    
+    if [[ $exit_code -ne 0 ]]; then
+        echo "Script exited with error code: $exit_code"
+    fi
+    
+    exit $exit_code
+}
+
+# Set trap for cleanup
+trap cleanup_on_exit EXIT INT TERM
+
 # These will be set in main() after help check
 SOURCE_NAMESPACE=""
 TARGET_NAMESPACE=""
 TARGET_BRANCH=""
 DRY_RUN=false
+NO_PROXY=false
+VERBOSE=false
+QUICK_MODE=false
+RESET_MODE=false
 GITHUB_SECRET_KEY=""
 
 SOURCE_GITHUB_OWNER="radpartners"
 SOURCE_GITHUB_REPO="rp-vna-deployments-dev"
+SOURCE_GITHUB_BRANCH=""
 TARGET_GITHUB_OWNER="achandra-rp"
 TARGET_GITHUB_REPO="cluster-config"
+TARGET_GITHUB_BRANCH=""
+
+# Color codes for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Colored output functions
+log_success() {
+    echo -e "${GREEN}✓${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}✗${NC} $1" >&2
+}
+
+log_warning() {
+    echo -e "${YELLOW}⚠${NC} $1"
+}
+
+log_info() {
+    echo -e "${BLUE}ℹ${NC} $1"
+}
+
+log_verbose() {
+    if [[ "$VERBOSE" == "true" ]]; then
+        echo -e "${BLUE}[VERBOSE]${NC} $1"
+    fi
+}
+
+# Input validation functions
+validate_namespace() {
+    local namespace="$1"
+    if [[ ! "$namespace" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+        log_error "Invalid namespace format: $namespace"
+        log_info "Namespace must contain only lowercase letters, numbers, and hyphens"
+        return 1
+    fi
+    return 0
+}
+
+validate_branch_name() {
+    local branch="$1"
+    if [[ ! "$branch" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
+        log_error "Invalid branch name format: $branch"
+        log_info "Branch name contains invalid characters"
+        return 1
+    fi
+    return 0
+}
 
 confirm_action() {
+    # Skip confirmation in quick mode
+    if [[ "$QUICK_MODE" == "true" ]]; then
+        log_verbose "Quick mode: Skipping confirmation"
+        return 0
+    fi
+    
     echo -n "Continue? [Y/n]: "
     read -r response
     # Default to yes if empty response (just pressing enter)
@@ -49,25 +148,39 @@ cleanup_local_files() {
 }
 
 cleanup_target_namespace() {
-    echo "=== Cleaning up target namespace: $TARGET_NAMESPACE ==="
+    # Only run if in reset mode or DRY_RUN is false
+    if [[ "$RESET_MODE" != "true" ]] && [[ "$DRY_RUN" == "true" ]]; then
+        log_verbose "Skipping target namespace cleanup (not in reset mode and dry run)"
+        return 0
+    fi
+    
+    log_info "Cleaning up target namespace: $TARGET_NAMESPACE"
     
     # Delete existing VNA CR if it exists
     if kubectl get vna vna-cr -n "$TARGET_NAMESPACE" >/dev/null 2>&1; then
-        echo "Deleting existing VNA CR in namespace $TARGET_NAMESPACE..."
-        kubectl delete vna vna-cr -n "$TARGET_NAMESPACE" || {
-            echo "Warning: Failed to delete existing VNA CR"
-        }
+        log_info "Deleting existing VNA CR in namespace $TARGET_NAMESPACE"
+        log_verbose "kubectl delete vna vna-cr -n $TARGET_NAMESPACE"
+        
+        if kubectl delete vna vna-cr -n "$TARGET_NAMESPACE"; then
+            log_success "VNA CR deletion initiated"
+        else
+            log_warning "Failed to delete existing VNA CR"
+            return 1
+        fi
         
         # Wait for deletion to complete
-        echo "Waiting for VNA CR deletion to complete..."
-        kubectl wait --for=delete vna/vna-cr -n "$TARGET_NAMESPACE" --timeout=60s || {
-            echo "Warning: VNA CR deletion did not complete within timeout"
-        }
+        log_info "Waiting for VNA CR deletion to complete (60s timeout)"
+        if kubectl wait --for=delete vna/vna-cr -n "$TARGET_NAMESPACE" --timeout=60s; then
+            log_success "VNA CR deletion completed"
+        else
+            log_warning "VNA CR deletion did not complete within timeout"
+            log_info "Continuing anyway - operator should handle remaining resources"
+        fi
     else
-        echo "No existing VNA CR found in namespace $TARGET_NAMESPACE"
+        log_info "No existing VNA CR found in namespace $TARGET_NAMESPACE"
     fi
     
-    echo "OK Target namespace cleanup complete"
+    log_success "Target namespace cleanup complete"
 }
 
 check_target_namespace_requirements() {
@@ -160,28 +273,37 @@ sync_github_configs() {
     echo "  Target: $target_dir"
     
     # Clone or update source repository (READ-ONLY)
-    echo "Setting up source repository (READ-ONLY)..."
+    log_info "Setting up source repository (READ-ONLY)"
     local source_ssh_url="git@github.com:$SOURCE_GITHUB_OWNER/$SOURCE_GITHUB_REPO.git"
     
     if [[ -d "$source_dir" ]]; then
-        echo "Source directory exists. Updating to latest..."
+        log_info "Source repository exists - updating to latest"
         cd "$source_dir"
         # Ensure we're in a clean state and never modify source
-        git reset --hard HEAD
-        git clean -fd
-        git fetch origin
-        git checkout "$SOURCE_GITHUB_BRANCH" || git checkout -b "$SOURCE_GITHUB_BRANCH" origin/"$SOURCE_GITHUB_BRANCH"
-        git reset --hard origin/"$SOURCE_GITHUB_BRANCH"
-        echo "OK Source repository updated to latest from origin/$SOURCE_GITHUB_BRANCH"
+        log_verbose "git reset --hard HEAD && git clean -fd"
+        git reset --hard HEAD >/dev/null 2>&1
+        git clean -fd >/dev/null 2>&1
+        
+        log_verbose "git fetch origin"
+        if git fetch origin >/dev/null 2>&1; then
+            log_success "Fetched latest changes from origin"
+        else
+            log_warning "Failed to fetch from origin - continuing with cached version"
+        fi
+        
+        log_verbose "git checkout $SOURCE_GITHUB_BRANCH"
+        git checkout "$SOURCE_GITHUB_BRANCH" >/dev/null 2>&1 || git checkout -b "$SOURCE_GITHUB_BRANCH" origin/"$SOURCE_GITHUB_BRANCH" >/dev/null 2>&1
+        git reset --hard origin/"$SOURCE_GITHUB_BRANCH" >/dev/null 2>&1
+        log_success "Source repository updated from origin/$SOURCE_GITHUB_BRANCH"
     else
-        echo "Cloning source repository..."
-        if ! git clone -b "$SOURCE_GITHUB_BRANCH" "$source_ssh_url" "$source_dir" 2>/dev/null; then
-            echo "Error: Could not clone source repository. Check SSH access permissions and branch name."
-            echo "Repository: $source_ssh_url@$SOURCE_GITHUB_BRANCH"
-            echo "Make sure you have SSH access to the repository and the branch exists."
+        log_verbose "Cloning source repository with shallow clone for faster performance"
+        if ! git clone --depth=1 -b "$SOURCE_GITHUB_BRANCH" "$source_ssh_url" "$source_dir" 2>/dev/null; then
+            log_error "Could not clone source repository"
+            log_info "Repository: $source_ssh_url@$SOURCE_GITHUB_BRANCH"
+            log_info "Check SSH access permissions and branch name"
             return 1
         fi
-        echo "OK Source repository cloned"
+        log_success "Source repository cloned"
     fi
     
     # Verify source repository is read-only by checking we're not accidentally in it
@@ -205,13 +327,14 @@ sync_github_configs() {
             git checkout -b "$TARGET_GITHUB_BRANCH"
         fi
     else
-        echo "Cloning target repository..."
-        if ! git clone "$target_ssh_url" "$target_dir" 2>/dev/null; then
-            echo "Error: Could not clone target repository"
-            echo "Repository: $target_ssh_url"
-            echo "Make sure you have SSH access to the repository."
+        log_verbose "Cloning target repository"
+        if ! git clone --depth=1 "$target_ssh_url" "$target_dir" 2>/dev/null; then
+            log_error "Could not clone target repository"
+            log_info "Repository: $target_ssh_url"
+            log_info "Check SSH access permissions"
             return 1
         fi
+        log_success "Target repository cloned"
         cd "$target_dir"
         # Check if target branch exists, create if not
         if git show-ref --verify --quiet "refs/remotes/origin/$TARGET_GITHUB_BRANCH"; then
@@ -327,43 +450,60 @@ Source: $SOURCE_GITHUB_OWNER/$SOURCE_GITHUB_REPO@$SOURCE_GITHUB_BRANCH
 Target: $TARGET_GITHUB_OWNER/$TARGET_GITHUB_REPO@$TARGET_GITHUB_BRANCH
 Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
         
-        git commit -m "$commit_msg"
-        
-        echo "Checking remote origin and pulling latest changes..."
-        # Ensure we're pushing to the correct target repository
-        local current_remote=$(git remote get-url origin)
-        local expected_remote="git@github.com:$TARGET_GITHUB_OWNER/$TARGET_GITHUB_REPO.git"
-        
-        if [[ "$current_remote" != "$expected_remote" ]]; then
-            echo "Warning: Remote origin mismatch!"
-            echo "  Current: $current_remote"
-            echo "  Expected: $expected_remote"
-            echo "  Fixing remote origin..."
-            git remote set-url origin "$expected_remote"
+        log_verbose "git commit -m \"$commit_msg\""
+        if git commit -m "$commit_msg"; then
+            log_success "Changes committed locally"
+        else
+            log_error "Failed to commit changes"
+            return 1
         fi
         
-        # Pull latest changes if branch exists on remote to avoid conflicts
-        if git ls-remote --heads origin "$TARGET_GITHUB_BRANCH" | grep -q "$TARGET_GITHUB_BRANCH"; then
-            echo "Branch exists on remote. Pulling latest changes..."
-            git pull origin "$TARGET_GITHUB_BRANCH" --rebase || {
-                echo "Warning: Git pull failed. Attempting force push..."
-                echo "Pushing to remote..."
-                git push origin "$TARGET_GITHUB_BRANCH" --force
-                echo "OK Configuration sync complete (force pushed)"
-                return 0
-            }
-        fi
+        # Git push strategy for transient destination repo
+        push_to_remote_repository
+    fi
+}
+
+push_to_remote_repository() {
+    log_info "Pushing changes to remote repository"
+    
+    # Verify remote origin configuration
+    local current_remote expected_remote
+    current_remote=$(git remote get-url origin 2>/dev/null || echo "")
+    expected_remote="git@github.com:$TARGET_GITHUB_OWNER/$TARGET_GITHUB_REPO.git"
+    
+    if [[ "$current_remote" != "$expected_remote" ]]; then
+        log_warning "Remote origin mismatch - fixing"
+        log_verbose "Current: $current_remote"
+        log_verbose "Expected: $expected_remote"
         
-        echo "Pushing to remote..."
-        git push origin "$TARGET_GITHUB_BRANCH"
-        echo "OK Configuration sync complete"
+        if git remote set-url origin "$expected_remote"; then
+            log_success "Remote origin updated"
+        else
+            log_error "Failed to update remote origin"
+            return 1
+        fi
+    fi
+    
+    # Since destination is transient, use aggressive push strategy
+    log_info "Force pushing to transient destination repository"
+    log_verbose "git push --force origin $TARGET_GITHUB_BRANCH"
+    
+    if git push --force origin "$TARGET_GITHUB_BRANCH" 2>&1; then
+        log_success "Configuration sync complete - changes pushed to GitHub"
+        log_info "Repository: https://github.com/$TARGET_GITHUB_OWNER/$TARGET_GITHUB_REPO/tree/$TARGET_GITHUB_BRANCH"
+        return 0
+    else
+        log_error "CRITICAL: Git push failed"
+        log_error "This is a fatal error - VNA deployment cannot proceed without GitHub sync"
+        log_info "Check your SSH access to: $TARGET_GITHUB_OWNER/$TARGET_GITHUB_REPO"
+        return 1
     fi
 }
 
 process_all_config_files() {
     local target_dir="$1"
     
-    echo "Processing configuration files in: $target_dir"
+    log_info "Processing configuration files in: $target_dir"
     
     # Find all YAML files and process them
     find "$target_dir" -name "*.yaml" -o -name "*.yml" | while read -r file; do
@@ -371,7 +511,7 @@ process_all_config_files() {
             continue
         fi
         
-        echo "  Processing: $(basename "$file")"
+        log_verbose "Processing: $(basename "$file")"
         process_single_config_file "$file"
     done
 }
@@ -379,6 +519,7 @@ process_all_config_files() {
 process_single_config_file() {
     local file_path="$1"
     local temp_file=$(mktemp)
+    TEMP_FILES+=("$temp_file")
     
     # Apply namespace-specific transformations
     sed \
@@ -415,6 +556,7 @@ process_single_config_file() {
 process_common_config_file() {
     local temp_file="$1"
     local temp_file2=$(mktemp)
+    TEMP_FILES+=("$temp_file2")
     
     # Update OTLP endpoints to standard port if they're using non-standard ports
     sed \
@@ -438,20 +580,37 @@ process_db_env_file() {
     local temp_file="$1"
     
     # Handle database host replacements for target namespace
-    # This is where you'd add specific database host mappings if needed
     case "$TARGET_NAMESPACE" in
         "ac001001")
-            sed -i \
-                -e 's/rpvna02-load-default\.cb4o8sm06f6f\.us-east-1\.rds\.amazonaws\.com/rpvna-ac001-default-pgdb-proxy.proxy-cb4o8sm06f6f.us-east-1.rds.amazonaws.com/g' \
-                -e 's/rpvna02-load-volatile\.cb4o8sm06f6f\.us-east-1\.rds\.amazonaws\.com/rpvna-ac001-volatile-pgdb-proxy.proxy-cb4o8sm06f6f.us-east-1.rds.amazonaws.com/g' \
-                -e 's/loadprimary/postgres/g' \
-                -e 's/loadsecondary/postgres/g' \
-                "$temp_file"
+            if [[ "$NO_PROXY" == "true" ]]; then
+                # Direct connection (no proxy)
+                sed -i \
+                    -e 's/rpvna02-load-default\.cb4o8sm06f6f\.us-east-1\.rds\.amazonaws\.com/rpvna-ac001-default-pgdb.cb4o8sm06f6f.us-east-1.rds.amazonaws.com/g' \
+                    -e 's/rpvna02-load-volatile\.cb4o8sm06f6f\.us-east-1\.rds\.amazonaws\.com/rpvna-ac001-volatile-pgdb.cb4o8sm06f6f.us-east-1.rds.amazonaws.com/g' \
+                    -e 's/loadprimary/postgres/g' \
+                    -e 's/loadsecondary/postgres/g' \
+                    "$temp_file"
+                log_success "Database connection: DIRECT (no proxy)"
+            else
+                # Proxy connection (default)
+                sed -i \
+                    -e 's/rpvna02-load-default\.cb4o8sm06f6f\.us-east-1\.rds\.amazonaws\.com/rpvna-ac001-default-pgdb-proxy.proxy-cb4o8sm06f6f.us-east-1.rds.amazonaws.com/g' \
+                    -e 's/rpvna02-load-volatile\.cb4o8sm06f6f\.us-east-1\.rds\.amazonaws\.com/rpvna-ac001-volatile-pgdb-proxy.proxy-cb4o8sm06f6f.us-east-1.rds.amazonaws.com/g' \
+                    -e 's/loadprimary/postgres/g' \
+                    -e 's/loadsecondary/postgres/g' \
+                    "$temp_file"
+                log_success "Database connection: PROXY"
+            fi
             ;;
         # Add more cases for other target namespaces as needed
         *)
-            echo "Warning: No specific database configuration for namespace: $TARGET_NAMESPACE"
-            echo "Using generic database host pattern replacement"
+            log_warning "No specific database configuration for namespace: $TARGET_NAMESPACE"
+            log_info "Using generic database host pattern replacement"
+            # For other namespaces, apply --no-proxy logic if enabled
+            if [[ "$NO_PROXY" == "true" ]]; then
+                log_info "Removing proxy from database URLs"
+                sed -i 's/-proxy\.proxy-/-/g' "$temp_file"
+            fi
             ;;
     esac
     
@@ -461,6 +620,69 @@ process_db_env_file() {
         echo "# Keeps the db-migration pod from restarting" >> "$temp_file"
         echo "RP_VNA_DB_KEEP_ALIVE: true" >> "$temp_file"
     fi
+}
+
+verify_deployment_health() {
+    local namespace="$1"
+    local timeout=300
+    
+    log_info "Verifying VNA deployment health (timeout: ${timeout}s)"
+    
+    # Step 1: Wait for VNA CR to be ready
+    log_verbose "Waiting for VNA CR condition=Ready"
+    if kubectl wait --for=condition=Ready --timeout=${timeout}s -n "$namespace" vna/vna-cr 2>/dev/null; then
+        log_success "VNA CR is ready"
+    else
+        log_warning "VNA CR did not become ready within timeout"
+        show_deployment_status "$namespace"
+        return 1
+    fi
+    
+    # Step 2: Check pod status
+    log_verbose "Checking pod readiness"
+    local ready_pods=$(kubectl get pods -n "$namespace" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | xargs)
+    local total_pods=$(kubectl get pods -n "$namespace" --no-headers 2>/dev/null | wc -l | xargs)
+    
+    if [[ "$ready_pods" -gt 0 ]]; then
+        log_success "Pods running: $ready_pods/$total_pods"
+    else
+        log_warning "No pods are in running state"
+        show_deployment_status "$namespace"
+        return 1
+    fi
+    
+    # Step 3: Quick service check
+    local services=$(kubectl get svc -n "$namespace" --no-headers 2>/dev/null | wc -l | xargs)
+    if [[ "$services" -gt 0 ]]; then
+        log_success "Services created: $services"
+    else
+        log_warning "No services found"
+    fi
+    
+    log_success "VNA deployment health verification complete"
+    
+    # Show deployment summary for operator testing
+    echo
+    echo "=== VNA Deployment Summary ==="
+    kubectl get vna -n "$namespace" -o wide 2>/dev/null || log_warning "Could not get VNA status"
+    echo
+    
+    return 0
+}
+
+show_deployment_status() {
+    local namespace="$1"
+    
+    log_info "Current deployment status:"
+    echo
+    echo "VNA Custom Resource:"
+    kubectl get vna -n "$namespace" -o wide 2>/dev/null || echo "  No VNA CR found"
+    echo
+    echo "Pods:"
+    kubectl get pods -n "$namespace" 2>/dev/null || echo "  No pods found"
+    echo
+    echo "Events (last 10):"
+    kubectl get events -n "$namespace" --sort-by='.lastTimestamp' --no-headers 2>/dev/null | tail -10 || echo "  No events found"
 }
 
 deploy_vna() {
@@ -495,16 +717,17 @@ deploy_vna() {
         exit 1
     fi
     
-    echo "Applying VNA CR to cluster..."
-    kubectl apply -f "$cr_file"
+    log_info "Applying VNA CR to cluster"
+    log_verbose "kubectl apply -f $cr_file"
+    if kubectl apply -f "$cr_file"; then
+        log_success "VNA CR applied successfully"
+    else
+        log_error "Failed to apply VNA CR"
+        return 1
+    fi
     
-    echo "Waiting for VNA deployment to be ready..."
-    kubectl wait --for=condition=Ready --timeout=300s -n "$TARGET_NAMESPACE" vna/vna-cr || {
-        echo "Warning: VNA deployment did not become ready within timeout"
-        echo "Check the status with: kubectl get vna -n $TARGET_NAMESPACE"
-    }
-    
-    echo "OK VNA deployment complete"
+    # Post-deployment health verification
+    verify_deployment_health "$TARGET_NAMESPACE"
 }
 
 check_prerequisites() {
@@ -556,19 +779,33 @@ Prerequisites:
   - Access to both source and target repositories
 
 Options:
-  --dry-run          Sync configs and create VNA CR but don't deploy to cluster
-  -h, --help         Show this help message
+  --dry-run                    Sync configs and create VNA CR but don't deploy to cluster
+  --no-proxy                   Remove proxy from database URLs (direct connection)
+  --verbose, -v                Enable verbose logging for debugging
+  --quick                      Skip confirmation prompts (for automated testing)
+  --reset                      Delete existing VNA CR before deployment
+  --source-namespace NS        Source namespace to copy from (default: rpvna)
+  --target-namespace NS        Target namespace to deploy to (default: ac001001)
+  --target-branch BRANCH       Target git branch name (default: same as TARGET_NAMESPACE)
+  --source-owner OWNER         Source GitHub repository owner (default: radpartners)
+  --source-repo REPO           Source GitHub repository name (default: rp-vna-deployments-dev)
+  --target-owner OWNER         Target GitHub repository owner (default: achandra-rp)
+  --target-repo REPO           Target GitHub repository name (default: cluster-config)
+  -h, --help                   Show this help message
 
-Arguments:
-  SOURCE_NAMESPACE   Source namespace to copy from (default: rpvna)
-  TARGET_NAMESPACE   Target namespace to deploy to (default: ac001001) 
-  TARGET_BRANCH      Target git branch name (default: same as TARGET_NAMESPACE)
+Arguments (positional):
+  SOURCE_NAMESPACE   Source namespace to copy from (overrides --source-namespace)
+  TARGET_NAMESPACE   Target namespace to deploy to (overrides --target-namespace) 
+  TARGET_BRANCH      Target git branch name (overrides --target-branch)
 
 Examples:
-  $0                           # Use defaults: rpvna -> ac001001
-  $0 --dry-run                 # Dry run with defaults (no deployment)
-  $0 rpvna ac001002           # rpvna -> ac001002, branch ac001002
-  $0 --dry-run rpvna ac001003 # Dry run: rpvna -> ac001003 (no deployment)
+  $0                                      # Use defaults: rpvna -> ac001001
+  $0 --dry-run                           # Dry run with defaults (no deployment)
+  $0 --quick --reset                     # Quick reset and deploy (testing workflow)
+  $0 --verbose --no-proxy                # Verbose mode with direct DB connection
+  $0 --target-namespace ac001002         # rpvna -> ac001002
+  $0 rpvna ac001002                      # rpvna -> ac001002, branch ac001002
+  $0 --dry-run --no-proxy rpvna ac001003 # Dry run with direct DB connection
 
 The script will:
 1. Pull the latest configuration from the source GitHub repository
@@ -577,6 +814,7 @@ The script will:
    - Service namespaces in OTEL attributes
    - Log file paths
    - Database hosts (for known mappings)
+   - Database proxy settings (with --no-proxy)
    - Resource names and references
 4. Create a new VNA CR with updated GitHub config
 5. Deploy the VNA CR to the target namespace (unless --dry-run)
@@ -613,11 +851,19 @@ EOF
     
     case "$TARGET_NAMESPACE" in
         "ac001001")
-            echo "- Default DB: rpvna-ac001-default-pgdb-proxy.proxy-cb4o8sm06f6f.us-east-1.rds.amazonaws.com"
-            echo "- Volatile DB: rpvna-ac001-volatile-pgdb-proxy.proxy-cb4o8sm06f6f.us-east-1.rds.amazonaws.com"
+            if [[ "$NO_PROXY" == "true" ]]; then
+                echo "- Default DB: rpvna-ac001-default-pgdb.cb4o8sm06f6f.us-east-1.rds.amazonaws.com (DIRECT)"
+                echo "- Volatile DB: rpvna-ac001-volatile-pgdb.cb4o8sm06f6f.us-east-1.rds.amazonaws.com (DIRECT)"
+            else
+                echo "- Default DB: rpvna-ac001-default-pgdb-proxy.proxy-cb4o8sm06f6f.us-east-1.rds.amazonaws.com"
+                echo "- Volatile DB: rpvna-ac001-volatile-pgdb-proxy.proxy-cb4o8sm06f6f.us-east-1.rds.amazonaws.com"
+            fi
             ;;
         *)
             echo "- No specific mappings configured (uses source values)"
+            if [[ "$NO_PROXY" == "true" ]]; then
+                echo "- Proxy removal: ENABLED (removes -proxy.proxy- patterns)"
+            fi
             ;;
     esac
     echo
@@ -635,6 +881,50 @@ main() {
                 DRY_RUN=true
                 shift
                 ;;
+            --no-proxy)
+                NO_PROXY=true
+                shift
+                ;;
+            --verbose|-v)
+                VERBOSE=true
+                shift
+                ;;
+            --quick)
+                QUICK_MODE=true
+                shift
+                ;;
+            --reset)
+                RESET_MODE=true
+                shift
+                ;;
+            --source-namespace)
+                SOURCE_NAMESPACE="$2"
+                shift 2
+                ;;
+            --target-namespace)
+                TARGET_NAMESPACE="$2"
+                shift 2
+                ;;
+            --target-branch)
+                TARGET_BRANCH="$2"
+                shift 2
+                ;;
+            --source-owner)
+                SOURCE_GITHUB_OWNER="$2"
+                shift 2
+                ;;
+            --source-repo)
+                SOURCE_GITHUB_REPO="$2"
+                shift 2
+                ;;
+            --target-owner)
+                TARGET_GITHUB_OWNER="$2"
+                shift 2
+                ;;
+            --target-repo)
+                TARGET_GITHUB_REPO="$2"
+                shift 2
+                ;;
             -*)
                 echo "Unknown option $1"
                 show_help
@@ -646,19 +936,41 @@ main() {
         esac
     done
     
-    # Set variables after option parsing
-    SOURCE_NAMESPACE="${1:-rpvna}"
-    TARGET_NAMESPACE="${2:-ac001001}"
-    TARGET_BRANCH="${3:-$TARGET_NAMESPACE}"
+    # Set variables after option parsing (positional args override explicit options)
+    SOURCE_NAMESPACE="${1:-${SOURCE_NAMESPACE:-rpvna}}"
+    TARGET_NAMESPACE="${2:-${TARGET_NAMESPACE:-ac001001}}"
+    TARGET_BRANCH="${3:-${TARGET_BRANCH:-$TARGET_NAMESPACE}}"
     
     SOURCE_GITHUB_BRANCH="$SOURCE_NAMESPACE"
     TARGET_GITHUB_BRANCH="$TARGET_BRANCH"
+    
+    # Input validation
+    validate_namespace "$SOURCE_NAMESPACE" || exit 1
+    validate_namespace "$TARGET_NAMESPACE" || exit 1 
+    validate_branch_name "$TARGET_BRANCH" || exit 1
+    
+    # Set cleanup tracking
+    CLEANUP_NEEDED=true
     
     echo "=== VNA Redeployment Script ==="
     if [[ "$DRY_RUN" == "true" ]]; then
         echo "Mode: DRY RUN (no deployment)"
     else
         echo "Mode: Full deployment"
+    fi
+    if [[ "$NO_PROXY" == "true" ]]; then
+        echo "Database proxy: DISABLED (direct connection)"
+    else
+        echo "Database proxy: ENABLED"
+    fi
+    if [[ "$VERBOSE" == "true" ]]; then
+        echo "Verbose mode: ENABLED"
+    fi
+    if [[ "$QUICK_MODE" == "true" ]]; then
+        echo "Quick mode: ENABLED (skip confirmations)"
+    fi
+    if [[ "$RESET_MODE" == "true" ]]; then
+        echo "Reset mode: ENABLED (delete existing VNA CR first)"
     fi
     echo "Source namespace: $SOURCE_NAMESPACE"
     echo "Target namespace: $TARGET_NAMESPACE" 
@@ -667,15 +979,29 @@ main() {
     echo "Target repo: $TARGET_GITHUB_OWNER/$TARGET_GITHUB_REPO@$TARGET_GITHUB_BRANCH"
     echo
     
-    check_prerequisites
-    cleanup_local_files
+    # Execute deployment pipeline with comprehensive error checking
+    if ! check_prerequisites; then
+        log_error "Prerequisites check failed - aborting deployment"
+        exit 1
+    fi
+    
+    if ! cleanup_local_files; then
+        log_error "Local cleanup failed - aborting deployment"
+        exit 1
+    fi
     
     # Only cleanup target namespace if not doing a dry run
     if [[ "$DRY_RUN" != "true" ]]; then
-        cleanup_target_namespace
+        if ! cleanup_target_namespace; then
+            log_error "Target namespace cleanup failed - aborting deployment"
+            exit 1
+        fi
     fi
     
-    check_target_namespace_requirements
+    if ! check_target_namespace_requirements; then
+        log_error "Target namespace requirements check failed - aborting deployment"
+        exit 1
+    fi
     
     echo "This script will synchronize ALL configuration files from source to target:"
     show_transformations
@@ -697,15 +1023,22 @@ main() {
     
     confirm_action
     
-    create_vna_cr
+    if ! create_vna_cr; then
+        log_error "VNA CR creation failed - aborting deployment"
+        exit 1
+    fi
     
     if sync_github_configs; then
+        log_success "GitHub configuration sync completed"
         echo
         deploy_vna
     else
         echo
-        echo "GitHub sync failed. You can still deploy with:"
+        log_error "CRITICAL: GitHub sync failed"
+        log_error "VNA deployment cannot proceed without GitHub configuration"
+        log_info "Manual deployment option:"
         echo "  kubectl apply -f $TARGET_NAMESPACE-vna.yaml"
+        log_warning "Note: Manual deployment may fail due to missing configuration"
         exit 1
     fi
     
@@ -722,17 +1055,18 @@ main() {
         echo "To run full deployment:"
         echo "  $0 $SOURCE_NAMESPACE $TARGET_NAMESPACE $TARGET_BRANCH"
     else
-        echo "=== Deployment Summary ==="
-        echo "VNA CR file: $TARGET_NAMESPACE-vna.yaml"
-        echo "Target namespace: $TARGET_NAMESPACE"
-        echo "GitHub config: $TARGET_GITHUB_OWNER/$TARGET_GITHUB_REPO@$TARGET_GITHUB_BRANCH"
+        echo
+        log_success "=== VNA DEPLOYMENT COMPLETE ==="
+        log_info "VNA CR file: $TARGET_NAMESPACE-vna.yaml"
+        log_info "Target namespace: $TARGET_NAMESPACE"
+        log_info "GitHub config: $TARGET_GITHUB_OWNER/$TARGET_GITHUB_REPO@$TARGET_GITHUB_BRANCH"
         echo
         echo "Check deployment status with:"
         echo "  kubectl get vna -n $TARGET_NAMESPACE"
         echo "  kubectl get pods -n $TARGET_NAMESPACE"
         echo
-        echo "To run this sync again (dry-run mode):"
-        echo "  $0 --dry-run $SOURCE_NAMESPACE $TARGET_NAMESPACE $TARGET_BRANCH"
+        echo "For quick testing workflow:"
+        echo "  $0 --quick --reset $SOURCE_NAMESPACE $TARGET_NAMESPACE $TARGET_BRANCH"
     fi
 }
 
