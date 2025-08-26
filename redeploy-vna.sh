@@ -16,8 +16,13 @@ cleanup_on_exit() {
         echo
         echo "=== Cleaning up temporary resources ==="
         
-        # Clean up temporary files
-        for temp_file in "${TEMP_FILES[@]}"; do
+        # Initialize TEMP_FILES if not already defined (safety)
+        if [[ -z "${TEMP_FILES+set}" ]]; then
+            TEMP_FILES=()
+        fi
+
+        # Clean up temporary files (safe with set -u if TEMP_FILES unset)
+        for temp_file in "${TEMP_FILES[@]:-}"; do
             if [[ -f "$temp_file" ]]; then
                 echo "Removing temporary file: $temp_file"
                 rm -f "$temp_file"
