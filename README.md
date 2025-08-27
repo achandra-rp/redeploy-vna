@@ -1,6 +1,6 @@
 # VNA Redeployment Script
 
-This script automates the redeployment of VNA (Virtual Network Archive) from a source namespace to a target namespace. It synchronizes GitHub configurations and Kubernetes resources.
+This script automates the redeployment of RP-VNA from a source namespace to a target namespace. It synchronizes GitHub configurations and Kubernetes resources.
 
 ## Usage
 
