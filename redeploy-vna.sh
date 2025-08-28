@@ -178,6 +178,10 @@ load_namespace_config() {
         CONFIG_DB_MODE=$(yq eval ".namespace_configs.$namespace.database.mode // .defaults.database.mode // \"remote\"" "$CONFIG_FILE" 2>/dev/null || echo "remote")
         CONFIG_DB_DEFAULT_HOST=$(yq eval ".namespace_configs.$namespace.database.default_host // .defaults.database.default_host // \"\"" "$CONFIG_FILE" 2>/dev/null || echo "")
         CONFIG_DB_VOLATILE_HOST=$(yq eval ".namespace_configs.$namespace.database.volatile_host // .defaults.database.volatile_host // \"\"" "$CONFIG_FILE" 2>/dev/null || echo "")
+        CONFIG_DB_DEFAULT_DB=$(yq eval ".namespace_configs.$namespace.database.default_db // .defaults.database.default_db // \"postgres\"" "$CONFIG_FILE" 2>/dev/null || echo "postgres")
+        CONFIG_DB_VOLATILE_DB=$(yq eval ".namespace_configs.$namespace.database.volatile_db // .defaults.database.volatile_db // \"postgres\"" "$CONFIG_FILE" 2>/dev/null || echo "postgres")
+        CONFIG_DB_DEFAULT_USER=$(yq eval ".namespace_configs.$namespace.database.default_user // .defaults.database.default_user // \"vna_postgres\"" "$CONFIG_FILE" 2>/dev/null || echo "vna_postgres")
+        CONFIG_DB_VOLATILE_USER=$(yq eval ".namespace_configs.$namespace.database.volatile_user // .defaults.database.volatile_user // \"vna_postgres\"" "$CONFIG_FILE" 2>/dev/null || echo "vna_postgres")
         CONFIG_TARGET_BRANCH=$(yq eval ".namespace_configs.$namespace.github.config_branch // \"\"" "$CONFIG_FILE" 2>/dev/null || echo "")
         CONFIG_DICOM_SIZE=$(yq eval ".namespace_configs.$namespace.storage.dicom_size // .defaults.storage.dicom_size // \"\"" "$CONFIG_FILE" 2>/dev/null || echo "")
         CONFIG_LOG_SIZE=$(yq eval ".namespace_configs.$namespace.storage.log_size // .defaults.storage.log_size // \"\"" "$CONFIG_FILE" 2>/dev/null || echo "")
@@ -192,6 +196,8 @@ load_namespace_config() {
         log_debug "Database mode: $CONFIG_DB_MODE"
         if [[ -n "$CONFIG_DB_DEFAULT_HOST" ]]; then
             log_debug "Database hosts: $CONFIG_DB_DEFAULT_HOST, $CONFIG_DB_VOLATILE_HOST"
+            log_debug "Database names: $CONFIG_DB_DEFAULT_DB, $CONFIG_DB_VOLATILE_DB"
+            log_debug "Database users: $CONFIG_DB_DEFAULT_USER, $CONFIG_DB_VOLATILE_USER"
         fi
         if [[ -n "$CONFIG_DICOM_SIZE" ]]; then
             log_debug "Storage sizes - DICOM: $CONFIG_DICOM_SIZE, Log: $CONFIG_LOG_SIZE"
@@ -210,8 +216,8 @@ cleanup_local_files() {
     fi
     
     log_debug "Repository directories will be reused and updated if they exist"
-    log_debug "  - $SCRIPT_DIR/rpvna-source-config"
-    log_debug "  - $SCRIPT_DIR/ac001001-target-config"
+    log_debug "  - $SCRIPT_DIR/$SOURCE_NAMESPACE-source-config"
+    log_debug "  - $SCRIPT_DIR/$TARGET_NAMESPACE-target-config"
     
     log_success "Local cleanup complete"
 }
@@ -292,7 +298,7 @@ create_vna_cr() {
     log_step "Creating VNA CR for $TARGET_NAMESPACE"
     
     local output_file="$TARGET_NAMESPACE-vna.yaml"
-    local source_cr_file="$SCRIPT_DIR/rpvna-dev.yaml"
+    local source_cr_file="$SCRIPT_DIR/$SOURCE_NAMESPACE.yaml"
     
     # Check if source CR file exists, if not pull it from source namespace
     if [[ ! -f "$source_cr_file" ]]; then
@@ -318,6 +324,13 @@ create_vna_cr() {
     else
         log_info "Using existing source CR file: $source_cr_file"
     fi
+    
+    # Extract source GitHub configuration from the source CR
+    SOURCE_GITHUB_BRANCH=$(yq eval '.spec.githubConfig.branch' "$source_cr_file" 2>/dev/null || echo "$SOURCE_NAMESPACE")
+    SOURCE_GITHUB_OWNER=$(yq eval '.spec.githubConfig.owner' "$source_cr_file" 2>/dev/null || echo "radpartners")
+    SOURCE_GITHUB_REPO=$(yq eval '.spec.githubConfig.repository' "$source_cr_file" 2>/dev/null || echo "rp-vna-deployments-dev")
+    
+    log_debug "Source GitHub config - Owner: $SOURCE_GITHUB_OWNER, Repo: $SOURCE_GITHUB_REPO, Branch: $SOURCE_GITHUB_BRANCH"
     
     # Create the new CR with comprehensive namespace and GitHub config updates
     sed "s/namespace: $SOURCE_NAMESPACE/namespace: $TARGET_NAMESPACE/g" "$source_cr_file" | \
@@ -352,8 +365,8 @@ create_vna_cr() {
 sync_github_configs() {
     log_step "Syncing GitHub configurations"
     
-    local source_dir="$SCRIPT_DIR/rpvna-source-config"
-    local target_dir="$SCRIPT_DIR/ac001001-target-config"
+    local source_dir="$SCRIPT_DIR/$SOURCE_NAMESPACE-source-config"
+    local target_dir="$SCRIPT_DIR/$TARGET_NAMESPACE-target-config"
     
     log_info "Repository directories:"
     log_info "  Source: $source_dir"
@@ -674,26 +687,102 @@ process_db_env_file() {
     elif [[ -n "$CONFIG_DB_DEFAULT_HOST" ]]; then
         log_info "Using configured database hosts"
         
-        # Apply configured database hosts
+        # Extract the source database configuration from the source env file
+        local source_db_env_file="$SCRIPT_DIR/$SOURCE_NAMESPACE-source-config/rp-vna-db-env.yaml"
+        local source_default_host=""
+        local source_volatile_host=""
+        local source_default_db=""
+        local source_volatile_db=""
+        local source_default_user=""
+        local source_volatile_user=""
+        
+        # If source env file exists, extract the source database configuration
+        if [[ -f "$source_db_env_file" ]]; then
+            # Extract DEFAULT_POSTGRES_HOST and VOLATILE_POSTGRES_HOST from source file
+            source_default_host=$(grep -E "^DEFAULT_POSTGRES_HOST:" "$source_db_env_file" | head -1 | cut -d' ' -f2 | tr -d ' ')
+            source_volatile_host=$(grep -E "^VOLATILE_POSTGRES_HOST:" "$source_db_env_file" | head -1 | cut -d' ' -f2 | tr -d ' ')
+            
+            # Extract DEFAULT_POSTGRES_DB and VOLATILE_POSTGRES_DB from source file
+            source_default_db=$(grep -E "^DEFAULT_POSTGRES_DB:" "$source_db_env_file" | head -1 | cut -d' ' -f2 | tr -d ' ')
+            source_volatile_db=$(grep -E "^VOLATILE_POSTGRES_DB:" "$source_db_env_file" | head -1 | cut -d' ' -f2 | tr -d ' ')
+            
+            # Extract DEFAULT_POSTGRES_USER and VOLATILE_POSTGRES_USER from source file
+            source_default_user=$(grep -E "^DEFAULT_POSTGRES_USER:" "$source_db_env_file" | head -1 | cut -d' ' -f2 | tr -d ' ')
+            source_volatile_user=$(grep -E "^VOLATILE_POSTGRES_USER:" "$source_db_env_file" | head -1 | cut -d' ' -f2 | tr -d ' ')
+            
+            # If those weren't found, try the alternate format (with = instead of :)
+            if [[ -z "$source_default_host" ]]; then
+                source_default_host=$(grep -E "^DEFAULT_POSTGRES_HOST=" "$source_db_env_file" | head -1 | cut -d'=' -f2 | tr -d ' ')
+            fi
+            
+            if [[ -z "$source_volatile_host" ]]; then
+                source_volatile_host=$(grep -E "^VOLATILE_POSTGRES_HOST=" "$source_db_env_file" | head -1 | cut -d'=' -f2 | tr -d ' ')
+            fi
+            
+            if [[ -z "$source_default_db" ]]; then
+                source_default_db=$(grep -E "^DEFAULT_POSTGRES_DB=" "$source_db_env_file" | head -1 | cut -d'=' -f2 | tr -d ' ')
+            fi
+            
+            if [[ -z "$source_volatile_db" ]]; then
+                source_volatile_db=$(grep -E "^VOLATILE_POSTGRES_DB=" "$source_db_env_file" | head -1 | cut -d'=' -f2 | tr -d ' ')
+            fi
+            
+            if [[ -z "$source_default_user" ]]; then
+                source_default_user=$(grep -E "^DEFAULT_POSTGRES_USER=" "$source_db_env_file" | head -1 | cut -d'=' -f2 | tr -d ' ')
+            fi
+            
+            if [[ -z "$source_volatile_user" ]]; then
+                source_volatile_user=$(grep -E "^VOLATILE_POSTGRES_USER=" "$source_db_env_file" | head -1 | cut -d'=' -f2 | tr -d ' ')
+            fi
+        fi
+        
+        # If we couldn't extract from source file, use the hardcoded defaults for backward compatibility
+        if [[ -z "$source_default_host" ]]; then
+            source_default_host="rpvna02-load-default.cb4o8sm06f6f.us-east-1.rds.amazonaws.com"
+        fi
+        
+        if [[ -z "$source_volatile_host" ]]; then
+            source_volatile_host="rpvna02-load-volatile.cb4o8sm06f6f.us-east-1.rds.amazonaws.com"
+        fi
+        
+        if [[ -z "$source_default_db" ]]; then
+            source_default_db="loadprimary"
+        fi
+        
+        if [[ -z "$source_volatile_db" ]]; then
+            source_volatile_db="loadsecondary"
+        fi
+        
+        if [[ -z "$source_default_user" ]]; then
+            source_default_user="vna_postgres"
+        fi
+        
+        if [[ -z "$source_volatile_user" ]]; then
+            source_volatile_user="vna_postgres"
+        fi
+        
+        # Apply configured database hosts, replacing the source hosts with the target hosts
         sed -i \
-            -e "s|rpvna02-load-default\.cb4o8sm06f6f\.us-east-1\.rds\.amazonaws\.com|$CONFIG_DB_DEFAULT_HOST|g" \
-            -e "s|rpvna02-load-volatile\.cb4o8sm06f6f\.us-east-1\.rds\.amazonaws\.com|$CONFIG_DB_VOLATILE_HOST|g" \
-            -e 's/loadprimary/postgres/g' \
-            -e 's/loadsecondary/postgres/g' \
+            -e "s|$source_default_host|$CONFIG_DB_DEFAULT_HOST|g" \
+            -e "s|$source_volatile_host|$CONFIG_DB_VOLATILE_HOST|g" \
+            -e "s|$source_default_db|$CONFIG_DB_DEFAULT_DB|g" \
+            -e "s|$source_volatile_db|$CONFIG_DB_VOLATILE_DB|g" \
+            -e "s|$source_default_user|$CONFIG_DB_DEFAULT_USER|g" \
+            -e "s|$source_volatile_user|$CONFIG_DB_VOLATILE_USER|g" \
             "$temp_file"
         
         log_success "Applied configured database hosts: $CONFIG_DB_DEFAULT_HOST, $CONFIG_DB_VOLATILE_HOST"
+        log_debug "Replaced database names: $source_default_db → $CONFIG_DB_DEFAULT_DB, $source_volatile_db → $CONFIG_DB_VOLATILE_DB"
+        log_debug "Replaced database users: $source_default_user → $CONFIG_DB_DEFAULT_USER, $source_volatile_user → $CONFIG_DB_VOLATILE_USER"
     else
-        # Fall back to existing hardcoded logic
-        log_verbose "Using hardcoded database configuration for namespace: $TARGET_NAMESPACE"
+        # Fall back to existing logic for backward compatibility
+        log_verbose "Using fallback database configuration for namespace: $TARGET_NAMESPACE"
         
         # Handle database host replacements for target namespace
         case "$TARGET_NAMESPACE" in
         "ac001001")
             # Default to proxy connection for ac001001
             sed -i \
-                -e 's/rpvna02-load-default\.cb4o8sm06f6f\.us-east-1\.rds\.amazonaws\.com/rpvna-ac001-default-pgdb-proxy.proxy-cb4o8sm06f6f.us-east-1.rds.amazonaws.com/g' \
-                -e 's/rpvna02-load-volatile\.cb4o8sm06f6f\.us-east-1\.rds\.amazonaws\.com/rpvna-ac001-volatile-pgdb-proxy.proxy-cb4o8sm06f6f.us-east-1.rds.amazonaws.com/g' \
                 -e 's/loadprimary/postgres/g' \
                 -e 's/loadsecondary/postgres/g' \
                 "$temp_file"
@@ -946,7 +1035,7 @@ The script will:
 3. Transform namespace-specific configurations:
    - Service namespaces in OTEL attributes
    - Log file paths
-   - Database hosts (for known mappings)
+   - Database hosts (dynamically extracted from source configuration)
    - Database proxy settings (with --no-proxy)
    - Resource names and references
 4. Create a new VNA CR with updated GitHub config
@@ -978,7 +1067,7 @@ show_transformations() {
                 ;;
             *)
                 if [[ -n "$CONFIG_DB_DEFAULT_HOST" ]]; then
-                    log_debug "  - Database: $CONFIG_DB_DEFAULT_HOST"
+                    log_debug "  - Database: $CONFIG_DB_DEFAULT_HOST (dynamically configured)"
                 else
                     log_debug "  - Database: No specific mappings configured"
                 fi
@@ -1032,6 +1121,7 @@ main() {
     TARGET_NAMESPACE="${2:-${TARGET_NAMESPACE:-test-pr-default}}"
     TARGET_BRANCH="${3:-${TARGET_BRANCH:-$TARGET_NAMESPACE}}"
     
+    # Set GitHub branch names (will be overridden by dynamic values from source CR)
     SOURCE_GITHUB_BRANCH="$SOURCE_NAMESPACE"
     TARGET_GITHUB_BRANCH="$TARGET_BRANCH"
     

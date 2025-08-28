@@ -1,0 +1,504 @@
+apiVersion: v1
+items:
+- apiVersion: radpartners.com/v1
+  kind: VNA
+  metadata:
+    labels:
+      app.kubernetes.io/created-by: vna-operator
+      app.kubernetes.io/instance: vna-cr
+      app.kubernetes.io/managed-by: kustomize
+      app.kubernetes.io/name: vna
+      app.kubernetes.io/part-of: vna-operator
+    name: vna-cr
+    namespace: rpvna
+  spec:
+    commonImageInfo:
+      imagePullPolicy: Always
+      pullSecret: github-registry-secret
+      registry: ghcr.io/radpartners/rp-vna
+      tag: 1285-0.2.3-hotfix
+    containerDefaults:
+      annotations:
+        fluentbit.io/exclude: "true"
+      envFrom:
+      - secretRef:
+          name: oauth-credentials
+    cronJobs:
+      commonGithubObjects:
+        githubEnvObjects:
+        - rp-vna-common-env
+        - postgres-config
+        githubFileObjects:
+        - configmapName: rp-vna-common-config
+          mapToLocation: /etc/opt/rp/vna/config/rp-vna-common-config.yaml
+      commonVolumesInfo:
+      - mountPath: /var/log/rp/vna/
+        name: rp-vna-logging
+        volumeSource:
+          persistentVolumeClaim:
+            claimName: rp-vna-logging-pvc
+      jobs:
+      - concurrencyPolicy: Forbid
+        imageInfo:
+          name: rp-vna-pending-delete-cleaner-native-micro
+        name: pending-delete-cleaner
+        schedule: 0 0 * * *
+      - concurrencyPolicy: Forbid
+        githubFileObjects:
+        - configmapName: rp-vna-db-cleaner
+          mapToLocation: /etc/opt/rp/vna/config/rp-vna-db-cleaner.yaml
+        imageInfo:
+          name: rp-vna-db-cleaner-native-micro
+        name: rp-vna-db-cleaner
+        schedule: 0 0 * * *
+      - concurrencyPolicy: Forbid
+        githubFileObjects:
+        - configmapName: rp-vna-prefetcher-common
+          mapToLocation: /etc/opt/rp/vna/config/rp-vna-prefetcher-common.yaml
+        imageInfo:
+          name: rp-vna-prefetcher-monitor-native-micro
+        name: prefetcher-monitor
+        schedule: '*/5 * * * *'
+      - concurrencyPolicy: Forbid
+        githubFileObjects:
+        - configmapName: rp-vna-prefetcher-common
+          mapToLocation: /etc/opt/rp/vna/config/rp-vna-prefetcher-common.yaml
+        imageInfo:
+          name: rp-vna-prefetcher-cleaner-native-micro
+        name: prefetcher-cleaner
+        schedule: '*/5 * * * *'
+    eventingConfig:
+      brokerDelivery:
+        backoffDelay: PT0S
+        backoffPolicy: linear
+        retry: 0
+      brokerName: kafka-broker
+      brokerType: kafka
+      kafkaConfig:
+        additionalConfig:
+          auto.create.topics.enable: "true"
+          compression.type: lz4
+          log.retention.hours: "168"
+        bootstrapServers: b-1.duse1rpekssrscmsk01.vtpqm1.c6.kafka.us-east-1.amazonaws.com:9096,b-2.duse1rpekssrscmsk01.vtpqm1.c6.kafka.us-east-1.amazonaws.com:9096,b-3.duse1rpekssrscmsk01.vtpqm1.c6.kafka.us-east-1.amazonaws.com:9096
+        numPartitions: 10
+        replicationFactor: 3
+        sasl:
+          enabled: true
+          passwordKey: ""
+          saslMechanism: ""
+          usernameKey: ""
+        secretName: kafka-secret
+        tls:
+          caFilename: ""
+          enabled: true
+          trustStoreFilename: ""
+          trustStorePasswordKey: ""
+      triggerDelivery:
+        backoffDelay: PT0.1S
+        backoffPolicy: linear
+        retry: 3
+    githubConfig:
+      branch: rpvna
+      owner: radpartners
+      repository: rp-vna-deployments-dev
+      secretKey: token
+      secretName: github-secret
+    githubObjects:
+    - configmapName: rp-vna-common-env
+      githubInfo:
+        branch: ""
+        owner: ""
+        repository: ""
+      path: rp-vna-common-env.yaml
+      syncPolicy: Always
+    - configmapName: rp-vna-common-config
+      githubInfo:
+        branch: ""
+        owner: ""
+        repository: ""
+      path: rp-vna-common-config.yaml
+      syncPolicy: Always
+    - configmapName: postgres-config
+      githubInfo:
+        branch: ""
+        owner: ""
+        repository: ""
+      path: rp-vna-db-env.yaml
+      syncPolicy: IfNotPresent
+    - configmapName: rp-vna-prefetcher-common
+      githubInfo:
+        branch: ""
+        owner: ""
+        repository: ""
+      path: prefetcher/rp-vna-prefetcher-common.yaml
+      syncPolicy: Always
+    - configmapName: rp-vna-hl7v2-server
+      githubInfo:
+        branch: ""
+        owner: ""
+        repository: ""
+      path: hl7/rp-vna-hl7v2-server.yaml
+      syncPolicy: Always
+    knativeServices:
+      commonGithubObjects:
+        githubEnvObjects:
+        - rp-vna-common-env
+        - postgres-config
+        githubFileObjects:
+        - configmapName: rp-vna-common-config
+          mapToLocation: /etc/opt/rp/vna/config/rp-vna-common-config.yaml
+      commonVolumesInfo:
+      - mountPath: /var/log/rp/vna/
+        name: rp-vna-logging
+        volumeSource:
+          persistentVolumeClaim:
+            claimName: rp-vna-logging-pvc
+      services:
+      - containerInfo:
+          containerConcurrency: 100
+          idleTimeoutSeconds: 1800
+          maxScale: 1000
+          minScale: 0
+          target: 100
+          timeoutSeconds: 300
+        name: store-rs
+      - containerInfo:
+          containerConcurrency: 100
+          idleTimeoutSeconds: 300
+          maxScale: 1000
+          minScale: 0
+          target: 100
+          timeoutSeconds: 300
+        name: store-transcode
+        triggers:
+        - delivery:
+            backoffDelay: PT0.1S
+            backoffPolicy: linear
+            retry: 3
+          filters:
+          - cesql: (source LIKE 'store-scp%' OR source LIKE 'store-rs%') AND type
+              = 'instance-stored'
+          name: store-transcode-trigger
+      - containerInfo:
+          containerConcurrency: 50
+          idleTimeoutSeconds: 300
+          maxScale: 1000
+          minScale: 0
+          target: 50
+          timeoutSeconds: 300
+        name: db-store
+        triggers:
+        - delivery:
+            backoffDelay: PT0.1S
+            backoffPolicy: linear
+            retry: 3
+          filters:
+          - cesql: source LIKE 'store-transcode%' AND type = 'instance-stored'
+          name: db-store-trigger
+      - containerInfo:
+          containerConcurrency: 100
+          idleTimeoutSeconds: 300
+          maxScale: 1000
+          minScale: 0
+          target: 100
+          timeoutSeconds: 300
+        name: study-completion-populator
+        triggers:
+        - delivery:
+            backoffDelay: PT0.1S
+            backoffPolicy: linear
+            retry: 3
+          filters:
+          - exact:
+              type: instance-metadata-stored
+          name: study-completion-populator-trigger
+      - containerInfo:
+          containerConcurrency: 100
+          idleTimeoutSeconds: 300
+          maxScale: 1000
+          minScale: 0
+          target: 100
+          timeoutSeconds: 300
+        name: study-manifest-retriever
+      - containerInfo:
+          containerConcurrency: 100
+          idleTimeoutSeconds: 1800
+          maxScale: 1000
+          minScale: 0
+          target: 100
+          timeoutSeconds: 300
+        name: rop-result
+      - containerInfo:
+          containerConcurrency: 100
+          idleTimeoutSeconds: 300
+          maxScale: 1000
+          minScale: 0
+          target: 100
+          timeoutSeconds: 300
+        name: query-rs
+      - containerInfo:
+          containerConcurrency: 100
+          idleTimeoutSeconds: 1800
+          maxScale: 1000
+          minScale: 0
+          target: 100
+          timeoutSeconds: 300
+        name: retrieve-rs
+      - containerInfo:
+          containerConcurrency: 50
+          idleTimeoutSeconds: 300
+          maxScale: 1000
+          minScale: 0
+          target: 50
+          timeoutSeconds: 300
+        name: study-manifest-generator
+        triggers:
+        - delivery:
+            backoffDelay: PT0.1S
+            backoffPolicy: linear
+            retry: 3
+          filter:
+            attributes:
+              type: study-manifest-generation-request
+          name: study-manifest-generator-manifest-generation-request-trigger
+        - delivery:
+            backoffDelay: PT0.1S
+            backoffPolicy: linear
+            retry: 3
+          filter:
+            attributes:
+              type: study-completed
+          name: study-manifest-generator-study-completed-trigger
+      - containerInfo:
+          containerConcurrency: 100
+          idleTimeoutSeconds: 300
+          maxScale: 1000
+          minScale: 0
+          target: 100
+          timeoutSeconds: 300
+        name: hl7v2-processor
+        triggers:
+        - delivery:
+            backoffDelay: PT0.1S
+            backoffPolicy: linear
+            retry: 3
+          filters:
+          - exact:
+              type: hl7v2-message-stored
+          name: hl7v2-processor-trigger
+        volumesInfo:
+        - mountPath: /var/lib/rp/vna/data/store
+          name: hl7-storage
+          volumeSource:
+            persistentVolumeClaim:
+              claimName: hl7-store-pvc
+      - containerInfo:
+          containerConcurrency: 100
+          idleTimeoutSeconds: 300
+          maxScale: 1000
+          minScale: 0
+          target: 100
+          timeoutSeconds: 300
+        githubFileObjects:
+        - configmapName: rp-vna-prefetcher-common
+          mapToLocation: /etc/opt/rp/vna/config/rp-vna-prefetcher-common.yaml
+        name: prefetcher-executor
+        triggers:
+        - delivery:
+            backoffDelay: PT0.1S
+            backoffPolicy: linear
+            retry: 3
+          filters:
+          - exact:
+              type: prefetch-start
+          name: prefetcher-executor-trigger
+      - containerInfo:
+          containerConcurrency: 100
+          idleTimeoutSeconds: 300
+          maxScale: 1000
+          minScale: 0
+          target: 100
+          timeoutSeconds: 300
+        githubFileObjects:
+        - configmapName: rp-vna-prefetcher-common
+          mapToLocation: /etc/opt/rp/vna/config/rp-vna-prefetcher-common.yaml
+        name: prefetcher-finalizer
+        triggers:
+        - delivery:
+            backoffDelay: PT0.1S
+            backoffPolicy: linear
+            retry: 3
+          filters:
+          - any:
+            - exact:
+                type: retrieve-remote-operation-completed
+            - exact:
+                type: store-remote-operation-completed
+          name: prefetcher-finalizer-trigger
+      - containerInfo:
+          containerConcurrency: 100
+          idleTimeoutSeconds: 300
+          maxScale: 1000
+          minScale: 0
+          target: 100
+          timeoutSeconds: 300
+        githubFileObjects:
+        - configmapName: rp-vna-prefetcher-common
+          mapToLocation: /etc/opt/rp/vna/config/rp-vna-prefetcher-common.yaml
+        name: prefetcher-scheduler
+        triggers:
+        - delivery:
+            backoffDelay: PT0.1S
+            backoffPolicy: linear
+            retry: 3
+          filters:
+          - any:
+            - exact:
+                type: imaging-service-request-stored
+            - exact:
+                type: imaging-service-request-updated
+            - exact:
+                type: imaging-service-request-deleted
+          name: prefetcher-scheduler-trigger
+    logLevel: info
+    postgresDB: remote
+    pvcs:
+    - name: hl7-store-pvc
+      pvcSpec:
+        accessModes:
+        - ReadWriteMany
+        resources:
+          requests:
+            storage: 10G
+        storageClassName: efs-sc
+    - name: rp-vna-logging-pvc
+      pvcSpec:
+        accessModes:
+        - ReadWriteMany
+        resources:
+          requests:
+            storage: 10G
+        storageClassName: efs-sc
+    - name: postgres-default-pvc
+      pvcSpec:
+        accessModes:
+        - ReadWriteOnce
+        resources:
+          requests:
+            storage: 10G
+        storageClassName: gp2
+    - name: postgres-volatile-pvc
+      pvcSpec:
+        accessModes:
+        - ReadWriteOnce
+        resources:
+          requests:
+            storage: 10G
+        storageClassName: gp2
+    reconcileConfig:
+      errorConditionTimer: 300
+      successConditionTimer: 3600
+    serviceAccountName: s3-sa
+    statefulsetServices:
+      commonGithubObjects:
+        githubEnvObjects:
+        - rp-vna-common-env
+        - postgres-config
+        githubFileObjects:
+        - configmapName: rp-vna-common-config
+          mapToLocation: /etc/opt/rp/vna/config/rp-vna-common-config.yaml
+      commonVolumesInfo:
+      - mountPath: /var/log/rp/vna/
+        name: rp-vna-logging
+        volumeSource:
+          persistentVolumeClaim:
+            claimName: rp-vna-logging-pvc
+      services:
+      - autoScale: true
+        containerInfo:
+          envFrom:
+          - secretRef:
+              name: postgres-passwd
+          maxReplicas: 0
+          minReplicas: 0
+          replicas: 1
+          terminationGracePeriodSeconds: 30
+        containerPorts:
+        - containerPort: 8080
+          protocol: TCP
+        name: db-migration
+        serviceSpec:
+          ports:
+          - name: db-migration
+            port: 80
+            protocol: TCP
+            targetPort: 8080
+      - autoScale: false
+        containerInfo:
+          maxReplicas: 0
+          minReplicas: 0
+          replicas: 1
+          terminationGracePeriodSeconds: 30
+        containerPorts:
+        - containerPort: 8080
+          protocol: TCP
+        name: study-completion-monitor
+        serviceSpec:
+          ports:
+          - name: study-completion-monitor
+            port: 80
+            protocol: TCP
+            targetPort: 8080
+      - autoScale: false
+        containerInfo:
+          maxReplicas: 0
+          minReplicas: 0
+          replicas: 1
+          terminationGracePeriodSeconds: 30
+        containerPorts:
+        - containerPort: 8080
+          protocol: TCP
+        name: rop-server
+        serviceSpec:
+          ports:
+          - name: rop-server
+            port: 80
+            protocol: TCP
+            targetPort: 8080
+        triggers:
+        - delivery:
+            backoffDelay: PT0.1S
+            backoffPolicy: linear
+            retry: 3
+          filters:
+          - exact:
+              type: remote-operation-request
+          name: rop-server-trigger
+          statefulSetSubscriberPort: 80
+      - autoScale: false
+        containerInfo:
+          maxReplicas: 0
+          minReplicas: 0
+          replicas: 1
+          terminationGracePeriodSeconds: 30
+        containerPorts:
+        - containerPort: 13050
+          protocol: TCP
+        githubFileObjects:
+        - configmapName: rp-vna-hl7v2-server
+          mapToLocation: /etc/opt/rp/vna/config/rp-vna-hl7v2-server.yaml
+        name: hl7v2-server
+        serviceSpec:
+          ports:
+          - name: hl7v2
+            port: 13050
+            protocol: TCP
+            targetPort: 0
+        volumesInfo:
+        - mountPath: /var/lib/rp/vna/data/store
+          name: hl7-storage
+          volumeSource:
+            persistentVolumeClaim:
+              claimName: hl7-store-pvc
+kind: List
+metadata: {}
